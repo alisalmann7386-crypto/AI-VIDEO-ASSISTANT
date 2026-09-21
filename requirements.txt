@@ -1,8 +1,9 @@
-# Deploy with Python 3.12 selected in Streamlit Community Cloud Advanced settings.
-# Audio conversion uses the system ffmpeg binary (see packages.txt), not pydub.
+# Select Python 3.12 in Streamlit Community Cloud Advanced settings.
+# ffmpeg is installed from packages.txt; PyDub is not needed.
 streamlit>=1.40,<2
 python-dotenv>=1.0,<2
 yt-dlp>=2025.1,<2027
+youtube-transcript-api>=1.2,<2
 groq>=0.18,<2
 langchain-core>=1.1,<2
 langchain-mistralai>=1.1,<2
