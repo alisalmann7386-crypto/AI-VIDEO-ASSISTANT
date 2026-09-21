@@ -1,6 +1,26 @@
+# Never commit credentials
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+
+# Python and tooling
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
 .venv/
 venv/
+
+# User media and temporary output
+temp_uploads/
+downloads/
 downloades/
+audio_chunks/
+*.mp3
+*.wav
+*.m4a
+*.mp4
+*.mkv
+*.webm

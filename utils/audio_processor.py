@@ -1,132 +1,138 @@
+"""Cloud-friendly media extraction. Requires ffmpeg and ffprobe (packages.txt)."""
+from __future__ import annotations
+
 import os
+from pathlib import Path
 import re
+import subprocess
 import tempfile
+from urllib.parse import parse_qs, urlparse
+
 import yt_dlp
-import streamlit as st
-from pydub import AudioSegment
+
+MAX_DURATION_SECONDS = 2 * 60 * 60
+ALLOWED_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com", "youtu.be", "www.youtu.be"}
 
 
-def is_youtube_url(url: str) -> bool:
-    """Checks if a string is a valid YouTube URL."""
-    youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
-    return bool(re.match(youtube_regex, url))
+def is_youtube_url(value: str) -> bool:
+    """Accept only well-formed YouTube video, Shorts and short URLs."""
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ALLOWED_HOSTS:
+        return False
+    if parsed.username or parsed.password or parsed.port:
+        return False
+    if parsed.hostname in {"youtu.be", "www.youtu.be"}:
+        return bool(re.fullmatch(r"/[A-Za-z0-9_-]{11}/?", parsed.path))
+    if parsed.path == "/watch":
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", parse_qs(parsed.query).get("v", [""])[0]))
+    return bool(re.fullmatch(r"/(shorts|live|embed)/[A-Za-z0-9_-]{11}/?", parsed.path))
+
+
+def _run(command: list[str], *, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(command, capture_output=True, text=True, check=True, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg/ffprobe is missing. Add ffmpeg to packages.txt.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Media conversion timed out; try a shorter recording.") from exc
+    except subprocess.CalledProcessError as exc:
+        # Never echo arbitrary video metadata or command output in the public UI.
+        raise RuntimeError("Could not decode this media. Try MP3, WAV, MP4, M4A or WEBM.") from exc
+
+
+def get_audio_duration(path: str | Path) -> float:
+    result = _run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)], timeout=30)
+    try:
+        return float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Could not determine audio duration.") from exc
 
 
 def split_audio_into_chunks(audio_path: str, chunk_length_ms: int = 10 * 60 * 1000) -> list[str]:
-    """Splits an audio file into smaller chunks (default 10 minutes) for API compatibility."""
-    audio = AudioSegment.from_file(audio_path)
-    
-    if len(audio) <= chunk_length_ms:
-        return [audio_path]
+    """Normalize audio to low-bandwidth MP3 chunks, avoiding pydub/audioop.
 
-    base_dir = os.path.dirname(audio_path)
-    base_name = os.path.splitext(os.path.basename(audio_path))[0]
-    chunks = []
-
-    for i, chunk in enumerate(audio[::chunk_length_ms]):
-        chunk_path = os.path.join(base_dir, f"{base_name}_chunk_{i}.mp3")
-        chunk.export(chunk_path, format="mp3")
-        chunks.append(chunk_path)
-
+    The 64-kbps mono audio chunks are below common transcription upload limits.
+    """
+    if chunk_length_ms <= 0:
+        raise ValueError("Audio chunk length must be positive.")
+    duration = get_audio_duration(audio_path)
+    if duration <= 0:
+        raise ValueError("The uploaded file contains no readable audio.")
+    if duration > MAX_DURATION_SECONDS:
+        raise ValueError("Audio longer than two hours is not supported; upload a shorter clip.")
+    output_dir = Path(audio_path).parent / "audio_chunks"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_pattern = str(output_dir / "part_%03d.mp3")
+    _run([
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(audio_path), "-vn", "-ac", "1", "-ar", "16000",
+        "-b:a", "64k", "-f", "segment", "-segment_time", str(chunk_length_ms / 1000),
+        "-reset_timestamps", "1", output_pattern,
+    ], timeout=600)
+    chunks = sorted(str(path) for path in output_dir.glob("part_*.mp3"))
+    if not chunks:
+        raise RuntimeError("No audio could be extracted. Check that the file contains an audio track.")
     return chunks
 
 
-def get_cookies_filepath() -> str | None:
-    """Reads YouTube cookies from Streamlit secrets and writes them to a temporary file."""
-    try:
-        if "YOUTUBE_COOKIES" in st.secrets and st.secrets["YOUTUBE_COOKIES"].strip():
-            temp_cookie_file = tempfile.NamedTemporaryFile(
-                mode="w+", delete=False, suffix=".txt"
-            )
-            temp_cookie_file.write(st.secrets["YOUTUBE_COOKIES"])
-            temp_cookie_file.close()
-            return temp_cookie_file.name
-    except Exception as e:
-        print(f"Warning: Could not read cookies from Streamlit secrets: {e}")
-    return None
-
-
-def download_youtube_audio(url: str) -> tuple[list[str], dict]:
-    """Downloads audio from YouTube bypassing Cloud IP blocks and missing format errors."""
-    output_dir = tempfile.mkdtemp()
-    out_template = os.path.join(output_dir, "%(id)s.%(ext)s")
-    
-    cookie_path = get_cookies_filepath()
-
-    ydl_opts = {
-        # Allow best overall format or best audio stream so fallback always works
-        "format": "bestaudio/best",
-        "outtmpl": out_template,
-        # Use mweb / ios client mix to preserve format availability while bypassing 403s
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["mweb", "ios", "android"],
-                "skip": ["dash", "hls"]
-            }
-        },
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-        "quiet": True,
-        "no_warnings": True,
-        "nocheckcertificate": True,
+def download_youtube_audio(url: str, work_dir: str | None = None) -> tuple[list[str], dict]:
+    """Download publicly accessible video audio. Cloud IP restrictions may still apply."""
+    if not is_youtube_url(url):
+        raise ValueError("Enter a valid YouTube video URL (watch, Shorts or youtu.be).")
+    directory = Path(work_dir or tempfile.mkdtemp(prefix="video_assistant_"))
+    directory.mkdir(parents=True, exist_ok=True)
+    options = {
+        "format": "bestaudio/best", "outtmpl": str(directory / "%(id)s.%(ext)s"),
+        "noplaylist": True, "quiet": True, "no_warnings": True,
+        "socket_timeout": 25, "retries": 2, "fragment_retries": 2,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
     }
-
-    if cookie_path:
-        ydl_opts["cookiefile"] = cookie_path
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            audio_filepath = os.path.splitext(filename)[0] + ".mp3"
-
-            duration_sec = info.get("duration", 0) or 0
-            metadata = {
-                "title": info.get("title", "YouTube Video"),
-                "channel": info.get("uploader", "Unknown Channel"),
-                "duration": f"{duration_sec // 60}m {duration_sec % 60}s",
-                "thumbnail": info.get("thumbnail", ""),
-                "url": url
-            }
-
-        chunks = split_audio_into_chunks(audio_filepath)
-        return chunks, metadata
-
-    finally:
-        if cookie_path and os.path.exists(cookie_path):
-            os.remove(cookie_path)
+    except yt_dlp.utils.DownloadError as exc:
+        raise RuntimeError("YouTube blocked this download or the video is unavailable. Try uploading an audio/video file instead; cloud IP restrictions cannot be guaranteed away.") from exc
+    if not isinstance(info, dict):
+        raise RuntimeError("YouTube did not return video information.")
+    audio_files = list(directory.glob("*.mp3"))
+    if not audio_files:
+        raise RuntimeError("No audio file was produced from this YouTube video.")
+    duration = int(info.get("duration") or 0)
+    if duration > MAX_DURATION_SECONDS:
+        raise ValueError("Videos longer than two hours are not supported.")
+    metadata = {
+        "title": str(info.get("title") or "YouTube Video"),
+        "channel": str(info.get("uploader") or "Unknown channel"),
+        "duration": f"{duration // 60}m {duration % 60}s" if duration else "Unknown",
+        "thumbnail": info.get("thumbnail"), "url": url,
+    }
+    return split_audio_into_chunks(str(audio_files[0])), metadata
 
 
 def process_local_file(file_path: str) -> tuple[list[str], dict]:
-    """Processes locally uploaded audio/video files into MP3 format and chunks them."""
-    file_name = os.path.basename(file_path)
-    base_name, ext = os.path.splitext(file_name)
-    ext = ext.lower().replace(".", "")
-
-    output_path = os.path.join(os.path.dirname(file_path), f"{base_name}_converted.mp3")
-
-    audio = AudioSegment.from_file(file_path, format=ext if ext != "mkv" else "matroska")
-    audio.export(output_path, format="mp3")
-
-    duration_sec = int(len(audio) / 1000)
+    """Process a file within its caller-owned temporary directory."""
+    path = Path(file_path)
+    if not path.is_file():
+        raise ValueError("The uploaded media file could not be found.")
+    duration = get_audio_duration(path)
+    if duration <= 0:
+        raise ValueError("The file has no readable audio track.")
+    if duration > MAX_DURATION_SECONDS:
+        raise ValueError("Videos longer than two hours are not supported.")
     metadata = {
-        "title": base_name,
-        "channel": "Local Upload",
-        "duration": f"{duration_sec // 60}m {duration_sec % 60}s",
-        "thumbnail": None,
-        "url": None
+        "title": path.stem, "channel": "Local upload",
+        "duration": f"{int(duration) // 60}m {int(duration) % 60}s",
+        "thumbnail": None, "url": None,
     }
-
-    chunks = split_audio_into_chunks(output_path)
-    return chunks, metadata
+    return split_audio_into_chunks(str(path)), metadata
 
 
-def process_input(source: str) -> tuple[list[str], dict]:
-    """Main routing function."""
+def process_input(source: str, work_dir: str | None = None) -> tuple[list[str], dict]:
+    """Route valid YouTube URLs or existing local media paths."""
     if is_youtube_url(source):
-        return download_youtube_audio(source)
-    else:
-        return process_local_file(source)
+        return download_youtube_audio(source, work_dir)
+    if source.strip().lower().startswith(("http://", "https://")):
+        raise ValueError("Only YouTube video URLs are supported. Other videos must be uploaded as files.")
+    return process_local_file(source)
