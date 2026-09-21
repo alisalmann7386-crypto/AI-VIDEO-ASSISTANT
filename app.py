@@ -9,6 +9,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from utils.audio_processor import is_youtube_url, process_input
+from core.youtube_captions import CaptionsUnavailable, MAX_TRANSCRIPT_CHARS, extract_video_id, fetch_youtube_captions
 from core.transcriber import transcribe_all
 from core.summarizer import generate_title, summarize
 from core.extractor import extract_insights
@@ -43,64 +44,116 @@ def safe_error(exc: Exception) -> str:
     return message[:500] or type(exc).__name__
 
 
-def missing_keys() -> list[str]:
-    return [key for key in ("GROQ_API_KEY", "MISTRAL_API_KEY") if not os.getenv(key, "").strip()]
+def has_key(name: str) -> bool:
+    return bool(os.getenv(name, "").strip())
 
 
 with st.sidebar:
     st.title("🎛️ Control panel")
-    st.caption("Analyze a public YouTube video or your own audio/video file.")
-    source_type = st.radio("Input source", ["YouTube URL", "Upload a file"])
+    st.caption("Analyze public YouTube captions, video audio, or a transcript you provide.")
+    source_type = st.radio("Input source", ["YouTube URL", "Upload a file", "Paste transcript"])
     url = ""
     uploaded = None
+    pasted_text = ""
+    reference_url = ""
     if source_type == "YouTube URL":
         url = st.text_input("YouTube link", placeholder="https://www.youtube.com/watch?v=...")
-        st.caption("Some public videos are blocked from cloud IP addresses. File upload is a reliable alternative.")
-    else:
+        st.caption("First tries available captions, then audio. YouTube can block both on cloud servers; use Paste transcript if needed.")
+    elif source_type == "Upload a file":
         uploaded = st.file_uploader("MP3, WAV, M4A, MP4, MKV or WEBM", type=["mp3", "wav", "m4a", "mp4", "mkv", "webm"])
-    language = st.selectbox("Spoken language", ["english", "hinglish"], help="Whisper supports both languages. Hinglish transcription is not automatic translation.")
-    st.caption("Maximum length: 2 hours. Large files may exceed Streamlit's upload limit.")
-    start = st.button("🚀 Analyze media", type="primary", use_container_width=True)
-    absent = missing_keys()
-    if absent:
-        st.warning("Add these keys in your app's Secrets settings: " + ", ".join(absent))
+    else:
+        pasted_text = st.text_area("Video transcript", height=200, placeholder="Paste the video's transcript here…")
+        reference_url = st.text_input("YouTube link (optional)", placeholder="https://www.youtube.com/watch?v=...")
+        st.caption("For videos with Show transcript on YouTube, copy the transcript and paste it here. Timestamps are unavailable in plain pasted text.")
+    language = st.selectbox("Spoken language", ["english", "hinglish"], help="Captions retain their source language. Groq Whisper transcribes English and Hinglish; this is not automatic translation.") if source_type != "Paste transcript" else "english"
+    st.caption("Maximum media length: 2 hours. Maximum pasted transcript: 120,000 characters.")
+    start = st.button("🚀 Analyze content", type="primary", use_container_width=True)
+    if not has_key("MISTRAL_API_KEY"):
+        st.warning("MISTRAL_API_KEY is required for summaries and chat. Add it in Streamlit Secrets.")
+    if source_type == "Upload a file" and not has_key("GROQ_API_KEY"):
+        st.warning("GROQ_API_KEY is required to transcribe uploaded media.")
+    elif source_type == "YouTube URL" and not has_key("GROQ_API_KEY"):
+        st.caption("GROQ_API_KEY is needed only if YouTube captions cannot be retrieved and audio transcription is required.")
 
 st.title("🎬 AI Video Assistant")
-st.caption("Transcribe, summarize, extract insights and ask questions grounded in a video's transcript.")
+st.caption("Captions or transcription → summary → key insights → transcript-grounded Q&A.")
 
 if start:
     st.session_state.analysis_data = None
     st.session_state.chat_history = []
-    if absent:
-        st.error("Missing API credentials. Add the listed keys in Streamlit Secrets and restart the app.")
+    if not has_key("MISTRAL_API_KEY"):
+        st.error("Missing MISTRAL_API_KEY. Add it to Streamlit app Secrets and restart the app.")
     elif source_type == "YouTube URL" and not is_youtube_url(url):
         st.error("Paste a valid YouTube watch, Shorts or youtu.be link.")
     elif source_type == "Upload a file" and uploaded is None:
         st.error("Upload an audio or video file before starting.")
+    elif source_type == "Upload a file" and not has_key("GROQ_API_KEY"):
+        st.error("Missing GROQ_API_KEY. It is required for audio transcription.")
+    elif source_type == "Paste transcript" and not pasted_text.strip():
+        st.error("Paste the video transcript before starting.")
+    elif source_type == "Paste transcript" and len(pasted_text) > MAX_TRANSCRIPT_CHARS:
+        st.error("The transcript is too long. Use fewer than 120,000 characters.")
+    elif source_type == "Paste transcript" and reference_url.strip() and not is_youtube_url(reference_url):
+        st.error("The optional reference link must be a valid YouTube video URL.")
     else:
-        with st.status("Processing media…", expanded=True) as status:
+        with st.status("Processing content…", expanded=True) as status:
             try:
-                # Every run has a private disposable workspace; names from uploaded files
-                # are not used as filesystem paths (prevents traversal and collisions).
+                # A disposable workspace keeps uploaded media off persistent disk.
                 with tempfile.TemporaryDirectory(prefix="ai_video_") as workspace:
-                    if uploaded is not None and source_type == "Upload a file":
+                    if source_type == "Paste transcript":
+                        st.write("📝 1/4 · Using your pasted transcript (no YouTube download needed)…")
+                        transcript_data = {"full_text": pasted_text.strip(), "segments": []}
+                        metadata = {
+                            "title": "Pasted video transcript", "channel": "Transcript supplied by user",
+                            "duration": "Unknown", "thumbnail": None,
+                            "url": reference_url.strip() or None, "transcript_source": "Pasted transcript",
+                        }
+                        if reference_url.strip():
+                            video_id = extract_video_id(reference_url)
+                            metadata["thumbnail"] = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                    elif source_type == "YouTube URL":
+                        st.write("📝 1/4 · Trying available YouTube captions…")
+                        try:
+                            transcript_data, metadata = fetch_youtube_captions(url.strip(), language=language)
+                            st.write("✅ Captions found. Skipping video download and audio transcription.")
+                        except CaptionsUnavailable:
+                            st.write("Captions are unavailable here; attempting audio download instead…")
+                            if not has_key("GROQ_API_KEY"):
+                                raise RuntimeError(
+                                    "YouTube captions were unavailable and GROQ_API_KEY is missing for audio transcription. "
+                                    "Add the Groq key, upload media, or select Paste transcript."
+                                ) from None
+                            try:
+                                chunks, metadata = process_input(url.strip(), work_dir=workspace)
+                            except RuntimeError as exc:
+                                if "YouTube blocked this download" in str(exc) or "No audio file was produced" in str(exc):
+                                    raise RuntimeError(
+                                        "Neither YouTube captions nor audio could be retrieved from this server. "
+                                        "The video may be unavailable or YouTube may be blocking cloud requests. "
+                                        "Select Paste transcript (copy it from YouTube's Show transcript feature) "
+                                        "or Upload a file you are allowed to process."
+                                    ) from exc
+                                raise
+                            st.write(f"🎙️ 2/4 · Transcribing {len(chunks)} audio chunk(s)…")
+                            transcript_data = transcribe_all(chunks, language=language)
+                            metadata["transcript_source"] = "Groq Whisper audio transcription"
+                    else:
                         suffix = Path(uploaded.name).suffix.lower()
                         file_path = Path(workspace) / f"upload{suffix}"
                         uploaded.seek(0)
                         with file_path.open("wb") as destination:
                             while block := uploaded.read(1024 * 1024):
                                 destination.write(block)
-                        source = str(file_path)
-                    else:
-                        source = url.strip()
-                    st.write("📥 1/4 · Extracting and normalizing audio…")
-                    chunks, metadata = process_input(source, work_dir=workspace)
-                    st.write(f"🎙️ 2/4 · Transcribing {len(chunks)} audio chunk(s)…")
-                    transcript_data = transcribe_all(chunks, language=language)
+                        st.write("📥 1/4 · Extracting and normalizing uploaded audio…")
+                        chunks, metadata = process_input(str(file_path), work_dir=workspace)
+                        st.write(f"🎙️ 2/4 · Transcribing {len(chunks)} audio chunk(s)…")
+                        transcript_data = transcribe_all(chunks, language=language)
+                        metadata["transcript_source"] = "Groq Whisper audio transcription"
+
                     transcript = transcript_data["full_text"]
                     segments = transcript_data.get("segments", [])
                     if not transcript.strip():
-                        raise ValueError("No intelligible speech was found in this file.")
+                        raise ValueError("The supplied content contains no readable transcript.")
                     st.write("🧠 3/4 · Summarizing and extracting key insights…")
                     title = generate_title(transcript)
                     summary = summarize(transcript)
@@ -116,10 +169,10 @@ if start:
             except Exception as exc:
                 status.update(label="❌ Analysis failed", state="error", expanded=True)
                 st.error(f"{type(exc).__name__}: {safe_error(exc)}")
-                st.info("For YouTube download errors, try a local file. For API errors, check your keys and provider quotas.")
+                st.info("If YouTube blocks captions and audio, select Paste transcript or Upload a file. For API errors, check keys and quotas.")
 
 if st.session_state.analysis_data is None:
-    st.info("👈 Select a YouTube video or upload an audio/video file, then click **Analyze media**.")
+    st.info("👈 Select a YouTube link, upload your media, or paste a transcript in the sidebar.")
 else:
     data = st.session_state.analysis_data
     metadata = data["metadata"]
@@ -128,10 +181,11 @@ else:
         if metadata.get("thumbnail"):
             st.image(metadata["thumbnail"], use_container_width=True)
         else:
-            st.info("🎧 Uploaded media")
+            st.info("📝 Transcript / uploaded media")
     with info_col:
         st.subheader(data["title"])
         st.write("**Source:**", metadata.get("channel") or "Local upload")
+        st.write("**Transcript obtained via:**", metadata.get("transcript_source", "Audio transcription"))
         st.write("**Duration:**", metadata.get("duration") or "Unknown")
         if metadata.get("url"):
             st.link_button("▶ Watch on YouTube", metadata["url"])
