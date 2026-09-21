@@ -43,8 +43,8 @@ def safe_error(exc: Exception) -> str:
     """Keep provider credentials and verbose upstream API responses out of the UI."""
     if is_rate_limited(exc):
         return ("The selected AI provider has reached its API rate or usage limit (HTTP 429). "
-                "Check its developer dashboard or use the other provider. Your transcript is saved "
-                "in this browser session; retry analysis without extracting it again.")
+                "Check its developer dashboard or use the other provider. Your transcript and "
+                "completed Groq chunk notes remain in this browser session for retry.")
     message = str(exc)
     for variable in ("GROQ_API_KEY", "MISTRAL_API_KEY"):
         secret = os.getenv(variable, "")
@@ -54,11 +54,13 @@ def safe_error(exc: Exception) -> str:
 
 
 def analyze_saved(data: dict, provider: str) -> None:
-    """Analyze cached transcript; preserve the text even when a provider rejects a call."""
+    """Analyze cached transcript; preserve completed Groq chunk notes on failure."""
     transcript = data["full_transcript"]
     segments = data.get("segments", [])
     if provider == "Groq":
-        result = analyze_with_groq(transcript)
+        result = analyze_with_groq(
+            transcript, checkpoint=data.setdefault("_groq_checkpoint", {}), progress=st.write,
+        )
         rag_chain = build_groq_rag(segments or transcript)
         data.update({**result, "rag_chain": rag_chain, "provider": "Groq"})
         return
@@ -70,11 +72,12 @@ def analyze_saved(data: dict, provider: str) -> None:
         data.update({"title": title, "summary": summary, "insights": insights,
                      "rag_chain": rag_chain, "coverage_note": "", "provider": "Mistral"})
     except Exception as exc:
-        # Do not silently switch for invalid keys or other unexpected failures.
         if not is_rate_limited(exc) or not has_key("GROQ_API_KEY"):
             raise
         st.info("Mistral reached its API limit. Switching to Groq without reprocessing your video…")
-        result = analyze_with_groq(transcript)
+        result = analyze_with_groq(
+            transcript, checkpoint=data.setdefault("_groq_checkpoint", {}), progress=st.write,
+        )
         data.update({**result, "rag_chain": build_groq_rag(segments or transcript),
                      "provider": "Groq (Mistral rate-limit fallback)"})
 
@@ -100,8 +103,10 @@ with st.sidebar:
                             help="Captions keep their original language; Whisper transcribes rather than translates.")
                 if source_type != "Paste transcript" else "english")
     providers = (["Groq", "Mistral"] if has_key("GROQ_API_KEY") else ["Mistral", "Groq"])
-    provider = st.selectbox("AI analysis provider", providers,
-                           help="Groq uses one structured request for title, summary and insights and local transcript search. Mistral may use multiple requests and embeddings.")
+    provider = st.selectbox(
+        "AI analysis provider", providers,
+        help="Groq processes the full transcript in sequential chunks when needed. This uses more API requests than short-video analysis. Mistral uses multiple requests and embeddings.",
+    )
     st.caption("Maximum media length: 2 hours; pasted text: 120,000 characters.")
     start = st.button("🚀 Analyze content", type="primary", use_container_width=True)
     if provider == "Groq" and not has_key("GROQ_API_KEY"):
@@ -112,7 +117,7 @@ with st.sidebar:
         st.warning("GROQ_API_KEY is required to transcribe uploaded media.")
 
 st.title("🎬 AI Video Assistant")
-st.caption("Captions or transcription → summary → key insights → transcript-grounded Q&A.")
+st.caption("YouTube captions OR audio transcription → full-transcript chunking → summary and insights → transcript-grounded Q&A.")
 
 if start:
     st.session_state.analysis_data = None
@@ -148,7 +153,7 @@ if start:
                         st.write("📝 1/4 · Trying available YouTube captions…")
                         try:
                             transcript_data, metadata = fetch_youtube_captions(url.strip(), language=language)
-                            st.write("✅ Captions found; no download or audio transcription required.")
+                            st.write("✅ Captions found. Speech-to-text is skipped because text already exists; the whole transcript will be analyzed.")
                         except CaptionsUnavailable as caption_error:
                             st.write("Captions unavailable; attempting audio download…")
                             if not has_key("GROQ_API_KEY"):
@@ -184,14 +189,13 @@ if start:
                     segments = transcript_data.get("segments", [])
                     if not transcript.strip():
                         raise ValueError("The supplied content contains no readable transcript.")
-                    # Persist text BEFORE the first paid chat/embedding request.
                     st.session_state.analysis_data = {
                         "title": metadata.get("title") or "Video transcript", "metadata": metadata,
                         "full_transcript": transcript, "segments": segments,
                         "summary": None, "insights": {}, "rag_chain": None,
-                        "coverage_note": "", "provider": provider,
+                        "coverage_note": "", "provider": provider, "_groq_checkpoint": {},
                     }
-                st.write("🧠 3/4 · Generating title, summary and insights…")
+                st.write("🧠 3/4 · Summarizing all transcript chunks and extracting insights…")
                 analyze_saved(st.session_state.analysis_data, provider)
                 st.write("🔎 4/4 · Preparing transcript-grounded Q&A…")
                 status.update(label="✅ Analysis complete", state="complete", expanded=False)
@@ -200,13 +204,12 @@ if start:
                     st.session_state.analysis_data["analysis_error"] = safe_error(exc)
                     status.update(label="⚠️ Transcript saved; AI analysis incomplete", state="error", expanded=True)
                     st.warning(safe_error(exc))
-                    st.info("The transcript below is retained. Retry analysis after checking your provider's API limits; no re-upload or YouTube download is needed.")
+                    st.info("The transcript and completed Groq chunk summaries remain in this session. Retry after checking provider limits; you won't need another media download.")
                 else:
                     status.update(label="❌ Content retrieval failed", state="error", expanded=True)
                     st.error(safe_error(exc))
                     st.info("For YouTube restrictions, try Paste transcript or Upload a file.")
 
-# Retry *only* the AI stage from the transcript saved in Streamlit session state.
 if st.session_state.analysis_data is not None and st.session_state.analysis_data.get("summary") is None:
     st.warning("Your transcript is saved in this session, but the AI provider did not finish the analysis.")
     if st.button("🔄 Retry analysis from saved transcript", use_container_width=True):
@@ -239,7 +242,7 @@ else:
         if metadata.get("url"):
             st.link_button("▶ Watch on YouTube", metadata["url"])
     if data.get("coverage_note"):
-        st.warning(data["coverage_note"])
+        st.info(data["coverage_note"])
     summary_tab, insights_tab, transcript_tab, chat_tab = st.tabs([
         "📋 Summary", "💡 Insights", "📝 Transcript", "💬 Ask the video",
     ])
