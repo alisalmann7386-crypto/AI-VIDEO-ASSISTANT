@@ -64,9 +64,12 @@ class GroqAnalysisTests(unittest.TestCase):
         request = client_class.return_value.chat.completions.create.call_args.kwargs
         self.assertIn("deadline", request["messages"][1]["content"])
 
-    def test_keyword_retrieval_does_not_call_api_without_match(self):
+    @patch("core.groq_analysis.Groq")
+    def test_keyword_retrieval_does_not_call_api_without_match(self, client_class):
         rag = build_groq_rag("The presenter talks about gardening and sunlight.")
-        self.assertIn("couldn't find", rag.invoke("quantum spacecraft"))
+        with patch.dict(os.environ, {"GROQ_API_KEY": "test-key"}):
+            self.assertIn("couldn't find", rag.invoke("quantum spacecraft"))
+        client_class.assert_not_called()
 
     def test_groq_key_is_required(self):
         with patch.dict(os.environ, {"GROQ_API_KEY": ""}):
