@@ -1,26 +1,8 @@
-# ── Streamlit UI & Framework ──────────────────────────────────────────────────
-streamlit>=1.35.0
-streamlit-extras>=0.4.0
-
-# ── Core Utilities & Environment ──────────────────────────────────────────────
-python-dotenv>=1.0.0
-numpy>=1.26.0
-requests>=2.32.0
-
-# ── Audio & Video Processing ──────────────────────────────────────────────────
-yt-dlp>=2024.03.10
-pydub>=0.25.1
-
-# ── Cloud APIs & SDKs ─────────────────────────────────────────────────────────
-groq>=0.9.0
-mistralai>=0.4.0
-
-# ── LLM Orchestration & RAG ───────────────────────────────────────────────────
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-community>=0.2.0
-langchain-mistralai>=0.1.0
-chromadb>=0.5.0
-sentence-transformers>=3.0.0
-langchain-huggingface>=0.0.3
-tiktoken>=0.7.0
+# Deploy with Python 3.12 selected in Streamlit Community Cloud Advanced settings.
+# Audio conversion uses the system ffmpeg binary (see packages.txt), not pydub.
+streamlit>=1.40,<2
+python-dotenv>=1.0,<2
+yt-dlp>=2025.1,<2027
+groq>=0.18,<2
+langchain-core>=1.1,<2
+langchain-mistralai>=1.1,<2
