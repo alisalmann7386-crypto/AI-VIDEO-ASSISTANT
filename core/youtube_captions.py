@@ -1,6 +1,6 @@
-"""Best-effort YouTube caption retrieval without downloading a media stream.
+"""Retrieve accessible YouTube captions, preserving language and timestamps.
 
-This is NOT a way around YouTube's cloud-IP restrictions: captions can be blocked too.
+No method here guarantees access when YouTube blocks a hosting IP.
 """
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from html import unescape
 import math
 from urllib.parse import parse_qs, urlparse
 
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import (
+    AgeRestricted, IpBlocked, NoTranscriptFound, RequestBlocked,
+    TranscriptsDisabled, VideoUnavailable, YouTubeTranscriptApi,
+)
 
 from utils.audio_processor import MAX_DURATION_SECONDS, is_youtube_url
 
@@ -16,11 +19,11 @@ MAX_TRANSCRIPT_CHARS = 120_000
 
 
 class CaptionsUnavailable(RuntimeError):
-    """The video has no accessible captions, or YouTube denied access."""
+    """No accessible transcript, or YouTube denied access."""
 
 
 def extract_video_id(url: str) -> str:
-    """Extract an 11-character ID only after the URL allowlist validates the host."""
+    """Extract a video ID after validating the URL's hostname."""
     if not is_youtube_url(url):
         raise ValueError("Enter a valid YouTube video URL.")
     parsed = urlparse(url.strip())
@@ -31,21 +34,46 @@ def extract_video_id(url: str) -> str:
     return parsed.path.strip("/").split("/")[-1]
 
 
-def fetch_youtube_captions(url: str, language: str = "english") -> tuple[dict, dict]:
-    """Return (transcription-like dict, UI metadata) for accessible captions.
+def select_caption_track(tracks, language: str):
+    """Prefer the user's language, then another available original-language track.
 
-    Prefers native English captions, or Hindi/English for the Hinglish setting.
-    Does not silently translate or claim Whisper transcribed the captions.
+    A missing English/Hindi track is not the same as a video having no captions.
+    The fallback does not translate captions and displays the actual track language.
     """
-    video_id = extract_video_id(url)
-    languages = ["hi", "hi-Latn", "en", "en-IN"] if language.lower() == "hinglish" else ["en", "en-US", "en-GB"]
+    preferred = (["hi", "hi-Latn", "en", "en-IN", "en-US", "en-GB"]
+                 if language.lower() == "hinglish"
+                 else ["en", "en-US", "en-GB", "en-IN", "hi", "hi-Latn"])
     try:
-        fetched = YouTubeTranscriptApi().fetch(video_id, languages=languages)
+        return tracks.find_transcript(preferred)
+    except NoTranscriptFound:
+        return next(iter(tracks), None)
+
+
+def fetch_youtube_captions(url: str, language: str = "english") -> tuple[dict, dict]:
+    """Return a transcription-like dict and metadata for accessible YouTube captions."""
+    video_id = extract_video_id(url)
+    if language.lower() not in {"english", "hinglish"}:
+        raise ValueError("Choose English or Hinglish.")
+    try:
+        tracks = YouTubeTranscriptApi().list(video_id)
+        chosen = select_caption_track(tracks, language)
+        if chosen is None:
+            raise CaptionsUnavailable("This video has no available captions.")
+        fetched = chosen.fetch()
+    except (IpBlocked, RequestBlocked) as exc:
+        raise CaptionsUnavailable(
+            "YouTube has blocked caption requests from this server's IP address. "
+            "Use Paste transcript or Upload a file; retrying the same server may not help."
+        ) from exc
+    except TranscriptsDisabled as exc:
+        raise CaptionsUnavailable("Captions are disabled for this video.") from exc
+    except (VideoUnavailable, AgeRestricted) as exc:
+        raise CaptionsUnavailable("The video is unavailable or requires authorization to access captions.") from exc
+    except CaptionsUnavailable:
+        raise
     except Exception as exc:
-        # The library may raise TranscriptsDisabled, VideoUnavailable, IpBlocked,
-        # RequestBlocked or an HTTP transport error. Never surface verbose upstream
-        # messages containing request URLs or other identifiers in a public app.
-        raise CaptionsUnavailable("YouTube captions are unavailable from this server.") from exc
+        # Do not surface upstream URLs or other sensitive request details in the UI.
+        raise CaptionsUnavailable("Could not retrieve YouTube captions from this server.") from exc
 
     segments: list[dict] = []
     parts: list[str] = []
@@ -79,12 +107,13 @@ def fetch_youtube_captions(url: str, language: str = "english") -> tuple[dict, d
 
     if not parts:
         raise CaptionsUnavailable("This video did not provide usable captions.")
+    track_language = str(getattr(chosen, "language", "Unknown language"))
     transcript = {"full_text": " ".join(parts), "segments": segments}
     seconds = int(last_end)
     metadata = {
         "title": "YouTube video (captions)", "channel": "YouTube captions",
         "duration": f"{seconds // 60}m {seconds % 60}s",
         "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-        "url": url.strip(), "transcript_source": "YouTube captions",
+        "url": url.strip(), "transcript_source": f"YouTube captions ({track_language})",
     }
     return transcript, metadata
